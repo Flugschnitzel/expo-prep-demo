@@ -32,12 +32,15 @@ def check_password() -> bool:
         st.error("Demo access is not configured. Set DEMO_ACCESS_CODE in the environment.")
         return False
 
-    code_input = st.text_input("Access Code", type="password")
-    if st.button("Unlock Demo", type="primary"):
-        if code_input and code_input == expected_code:
-            st.session_state["authenticated"] = True
-            st.rerun()
-        st.error("Incorrect code. Please verify credentials.")
+    with st.form("demo_auth_form", clear_on_submit=False):
+        code_input = st.text_input("Access Code", type="password")
+        submitted = st.form_submit_button("Unlock Demo", type="primary")
+
+        if submitted:
+            if code_input and code_input == expected_code:
+                st.session_state["authenticated"] = True
+                st.rerun()
+            st.error("Incorrect code. Please verify credentials.")
 
     return False
 
