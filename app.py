@@ -19,6 +19,28 @@ from pypdf import PdfReader
 
 load_dotenv()
 
+
+def check_password() -> bool:
+    if st.session_state.get("authenticated"):
+        return True
+
+    expected_code = os.getenv("DEMO_ACCESS_CODE") or ""
+
+    st.title("🔒 ExpoPrep Demo Access")
+    st.info("Enter the demo access code to launch the agent.")
+    if not expected_code:
+        st.error("Demo access is not configured. Set DEMO_ACCESS_CODE in the environment.")
+        return False
+
+    code_input = st.text_input("Access Code", type="password")
+    if st.button("Unlock Demo", type="primary"):
+        if code_input and code_input == expected_code:
+            st.session_state["authenticated"] = True
+            st.rerun()
+        st.error("Incorrect code. Please verify credentials.")
+
+    return False
+
 # ---------------------------------------------------------------------------
 # Models / constants
 # ---------------------------------------------------------------------------
@@ -427,6 +449,9 @@ st.set_page_config(
     page_icon="🎯",
 )
 
+if not check_password():
+    st.stop()
+
 st.markdown(
     """
     <style>
@@ -535,6 +560,11 @@ with st.sidebar:
     resume_text = resume_from_pdf.strip() or pasted.strip()
 
     role = st.text_input("Target role", value=DEFAULT_ROLE)
+
+    st.divider()
+    if st.sidebar.button("Log out"):
+        st.session_state["authenticated"] = False
+        st.rerun()
 
 secret_keys = _active_secret_keys(
     gemini_override=custom_gemini,
