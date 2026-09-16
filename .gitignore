@@ -1,0 +1,11 @@
+# API Keys & Secrets
+.env
+*.env
+
+# Python & Virtualenv
+venv/
+__pycache__/
+*.pyc
+
+# Streamlit Cache
+.streamlit/
