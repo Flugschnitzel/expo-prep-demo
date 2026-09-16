@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Any, Callable
 
 import streamlit as st
@@ -23,20 +24,17 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 
 MODELS = {
-    "Gemini 2.5 Flash": "gemini/gemini-2.5-flash",
+    "Gemini 3.6 Flash": "gemini/gemini-3.6-flash",
     "Grok Beta / Grok 2": "xai/grok-2-latest",
 }
-# Gemini 2.5 Flash is the default id; some keys now 404 it and need a successor.
-GEMINI_FALLBACKS = [
-    "gemini/gemini-2.5-flash",
-    "gemini/gemini-flash-latest",
-    "gemini/gemini-2.0-flash",
-    "gemini/gemini-3.6-flash",
-]
-DEFAULT_MODEL_LABEL = "Gemini 2.5 Flash"
+DEFAULT_MODEL_LABEL = "Gemini 3.6 Flash"
 DEFAULT_ROLE = "Forward Deployed AI Engineer / Intern"
 COMPANY_PRESETS = ["Galatiq", "Rice University AI Lab"]
 MAX_REACT_TURNS = 5
+
+BRIEFING_QUICK = "Booth Quick-Scan (High-Density / 45-Sec Read)"
+BRIEFING_DEEP = "Deep-Dive Dossier (Comprehensive)"
+BRIEFING_MODES = [BRIEFING_QUICK, BRIEFING_DEEP]
 
 SEARCH_WEB_TOOL: dict[str, Any] = {
     "type": "function",
@@ -60,25 +58,56 @@ SEARCH_WEB_TOOL: dict[str, Any] = {
     },
 }
 
+NEWS_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "fetch_latest_company_news",
+        "description": (
+            "Fetch the latest public headlines for a company (news, blog, or announcement). "
+            "Call this once for the target company so you can write the Latest News Hook."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "company_name": {
+                    "type": "string",
+                    "description": "Company or lab name to pull recent headlines for.",
+                }
+            },
+            "required": ["company_name"],
+        },
+    },
+}
+
+AGENT_TOOLS = [SEARCH_WEB_TOOL, NEWS_TOOL]
+
 SYSTEM_PROMPT = """You are ExpoPrep, a career-fair and networking co-pilot.
 
-You receive a candidate resume, a target company, and a target role.
-Your job is to produce a concise, high-signal prep briefing the candidate can use
-on the expo floor in under two minutes.
+You receive a candidate resume, a target company, a target role, and a briefing mode.
+Your job is to produce a high-signal prep briefing the candidate can use on the expo floor.
 
-Always use the search_web tool (one or more queries) to gather:
-- what the company actually builds / researches
-- engineering focus and likely tech stack
-- recent news, initiatives, hiring, or expo/career-fair presence
+Always use tools before writing the final briefing:
+- search_web for what the company builds, engineering focus, tech stack, hiring, expo presence
+- fetch_latest_company_news for the two most recent headlines (required for the News Hook)
 
 Then produce a FINAL answer in GitHub-flavored Markdown with EXACTLY these sections:
 
 ## 🏢 Company Snapshot
-Core business, engineering focus, and tech stack (bullet points).
+Core business, engineering focus, and tech stack.
 
 ## 🎯 Elevator Pitch
-2–4 sentences aligning the candidate's resume strengths with the company's domain.
+Aligning candidate resume strengths with the company's domain.
 Write it in first person so they can say it out loud.
+
+## 📰 Latest News Hook
+A dedicated card: headline(s) from fetch_latest_company_news, one-line why it matters,
+and one spoken opener the candidate can use at the booth. Do not invent headlines.
+
+## 🎯 Skill Match & Gap Defense
+### Direct Matches
+Candidate resume strengths that fit the company's domain.
+### Potential Gaps & Bridge Strategy
+Likely gaps vs the role, and how to proactively defend them in conversation.
 
 ## 🧊 3 Contextual Icebreakers
 Three numbered icebreakers that reference recent news, products, or expo presence.
@@ -90,9 +119,22 @@ They should demonstrate genuine homework, not "tell me about your culture."
 
 Rules:
 - Do not invent citations. If search is thin, say so briefly and still be useful.
-- Keep the briefing tight: scannable on a phone between booths.
-- After you have enough search context, stop calling tools and write the briefing.
+- After you have enough tool context, stop calling tools and write the briefing.
+- Follow the briefing-mode instructions in the user message exactly.
 """
+
+QUICK_SCAN_INSTRUCTIONS = (
+    "BRIEFING MODE: Booth Quick-Scan (High-Density / 45-Sec Read).\n"
+    "Write for a phone glance between booths. Crisp, high-impact bullet points only. "
+    "No dense paragraphs. Elevator pitch: 2 short spoken sentences max. "
+    "Every section should be scannable in about 45 seconds."
+)
+
+DEEP_DIVE_INSTRUCTIONS = (
+    "BRIEFING MODE: Deep-Dive Dossier (Comprehensive).\n"
+    "You may use short paragraphs plus bullets. Cover product surface area, "
+    "likely interview themes, and a fuller gap-defense strategy. Stay useful, not padded."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +165,31 @@ def search_web(query: str) -> str:
     return "\n\n".join(blocks)
 
 
+def fetch_latest_company_news(company_name: str) -> str:
+    """Top 2 DuckDuckGo headlines for company news / blog / announcements."""
+    company_name = (company_name or "").strip()
+    if not company_name:
+        return "No company name provided."
+
+    query = f"{company_name} news OR blog OR announcement"
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=2))
+    except Exception as exc:
+        return f"News search failed for {company_name!r}: {exc}"
+
+    if not results:
+        return f"No recent headlines found for {company_name!r}."
+
+    blocks: list[str] = []
+    for i, item in enumerate(results, start=1):
+        title = (item.get("title") or "Untitled").strip()
+        snippet = (item.get("body") or item.get("snippet") or "").strip()
+        link = (item.get("href") or item.get("link") or "").strip()
+        blocks.append(f"Headline {i}: {title}\nSummary: {snippet}\nLink: {link}")
+    return "\n\n".join(blocks)
+
+
 def extract_pdf_text(uploaded_file) -> str:
     """Extract raw text from an uploaded PDF (Streamlit UploadedFile or file-like)."""
     if uploaded_file is None:
@@ -145,12 +212,64 @@ def extract_pdf_text(uploaded_file) -> str:
 # LiteLLM helpers
 # ---------------------------------------------------------------------------
 
-def _api_key_for_model(model_id: str) -> str | None:
+def _env_gemini_key() -> str:
+    return (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
+
+
+def _env_xai_key() -> str:
+    return (os.getenv("XAI_API_KEY") or "").strip()
+
+
+def _mask_api_key(key: str) -> str:
+    key = (key or "").strip()
+    if len(key) <= 8:
+        return "****" if not key else f"{key[:1]}…{key[-1:]}"
+    return f"{key[:4]}...{key[-4:]}"
+
+
+def _key_source_caption(custom: str, env_key: str) -> str:
+    custom = (custom or "").strip()
+    env_key = (env_key or "").strip()
+    if custom:
+        return f"`{_mask_api_key(custom)}` (from custom input)"
+    if env_key:
+        return f"`{_mask_api_key(env_key)}` (from .env)"
+    return "Not set"
+
+
+def _api_key_for_model(
+    model_id: str,
+    *,
+    gemini_override: str = "",
+    xai_override: str = "",
+) -> str | None:
     if model_id.startswith("gemini/"):
-        return os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+        return (gemini_override or "").strip() or _env_gemini_key() or None
     if model_id.startswith("xai/"):
-        return os.getenv("XAI_API_KEY")
+        return (xai_override or "").strip() or _env_xai_key() or None
     return None
+
+
+def _briefing_filename(company: str) -> str:
+    slug = "".join(ch if ch.isalnum() or ch in "-_ " else "" for ch in company).strip()
+    slug = "_".join(slug.split()) or "company"
+    return f"{slug}_prep.md"
+
+
+def _execute_tool(name: str, args: dict[str, Any]) -> tuple[str, str]:
+    """Run a registered tool. Returns (log_label, tool_output)."""
+    if name == "search_web":
+        query = str(args.get("query", "")).strip()
+        return f"🔍 `search_web` query: `{query}`", search_web(query)
+    if name == "fetch_latest_company_news":
+        company_name = str(
+            args.get("company_name") or args.get("query") or ""
+        ).strip()
+        return (
+            f"📰 `fetch_latest_company_news` company: `{company_name}`",
+            fetch_latest_company_news(company_name),
+        )
+    return f"Unknown tool `{name}`.", f"Unknown tool `{name}`."
 
 
 def _assistant_message_to_dict(message: Any) -> dict[str, Any]:
@@ -184,17 +303,24 @@ def run_react_loop(
     company: str,
     role: str,
     resume_text: str,
+    briefing_mode: str,
+    api_key: str,
     log: Callable[[str], None],
 ) -> str:
     """Autonomous tool-using loop. Returns the model's final markdown briefing."""
-    api_key = _api_key_for_model(model_id)
     if not api_key:
         raise RuntimeError(
             f"No API key found for model `{model_id}`. "
-            "Set GEMINI_API_KEY or XAI_API_KEY in your .env file."
+            "Paste a custom key in the sidebar or set GEMINI_API_KEY / XAI_API_KEY in `.env`."
         )
 
+    mode_instructions = (
+        QUICK_SCAN_INSTRUCTIONS
+        if briefing_mode == BRIEFING_QUICK
+        else DEEP_DIVE_INSTRUCTIONS
+    )
     user_payload = (
+        f"{mode_instructions}\n\n"
         f"Target company: {company}\n"
         f"Target role: {role}\n\n"
         f"Candidate resume:\n{resume_text.strip() or '(No resume provided.)'}"
@@ -204,41 +330,14 @@ def run_react_loop(
         {"role": "user", "content": user_payload},
     ]
 
-    active_model = model_id
-
     def _complete(**kwargs: Any):
-        nonlocal active_model
-        if active_model.startswith("gemini/"):
-            candidates = [active_model] + [m for m in GEMINI_FALLBACKS if m != active_model]
-        else:
-            candidates = [active_model]
-        last_err: Exception | None = None
-        for candidate in candidates:
-            try:
-                result = completion(model=candidate, api_key=api_key, **kwargs)
-                if candidate != active_model:
-                    log(f"Model `{active_model}` unavailable — switched to `{candidate}`.")
-                    active_model = candidate
-                return result
-            except Exception as exc:
-                last_err = exc
-                err_text = str(exc).lower()
-                retryable = (
-                    "notfound" in err_text
-                    or "404" in err_text
-                    or "no longer available" in err_text
-                )
-                if retryable and candidate != candidates[-1]:
-                    log(f"`{candidate}` rejected; trying next Gemini model id.")
-                    continue
-                raise
-        raise last_err or RuntimeError("No model accepted the request.")
+        return completion(model=model_id, api_key=api_key, **kwargs)
 
     for turn in range(1, MAX_REACT_TURNS + 1):
-        log(f"**Turn {turn}/{MAX_REACT_TURNS}** — calling `{active_model}`…")
+        log(f"**Turn {turn}/{MAX_REACT_TURNS}** — calling `{model_id}`…")
         response = _complete(
             messages=messages,
-            tools=[SEARCH_WEB_TOOL],
+            tools=AGENT_TOOLS,
             tool_choice="auto",
         )
         message = response.choices[0].message
@@ -263,13 +362,9 @@ def run_react_loop(
             except json.JSONDecodeError:
                 args = {"query": raw_args}
 
-            if name != "search_web":
-                tool_output = f"Unknown tool `{name}`."
-            else:
-                query = str(args.get("query", "")).strip()
-                log(f"🔍 `search_web` query: `{query}`")
-                tool_output = search_web(query)
-                log(f"📄 Tool output:\n```\n{tool_output}\n```")
+            label, tool_output = _execute_tool(name, args)
+            log(label)
+            log(f"📄 Tool output:\n```\n{tool_output}\n```")
 
             messages.append(
                 {
@@ -321,6 +416,13 @@ st.markdown(
       }
       .expoprep-hero h1 { font-size: 1.7rem; margin: 0 0 0.35rem 0; }
       .expoprep-hero p { margin: 0; opacity: 0.88; }
+      .news-hook {
+        background: #f0f9ff;
+        border: 1px solid #7dd3fc;
+        border-radius: 12px;
+        padding: 0.85rem 1.05rem;
+        margin: 0.35rem 0 1rem 0;
+      }
     </style>
     """,
     unsafe_allow_html=True,
@@ -349,8 +451,22 @@ with st.sidebar:
     st.caption(f"`{model_id}`")
 
     st.subheader("API keys")
-    gemini_ok = bool(os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"))
-    xai_ok = bool(os.getenv("XAI_API_KEY"))
+    custom_gemini = st.text_input(
+        "Custom Gemini API Key",
+        type="password",
+        placeholder="Optional — falls back to GEMINI_API_KEY",
+        help="Bring-your-own Gemini key. If empty, ExpoPrep uses GEMINI_API_KEY from .env.",
+    )
+    st.caption(_key_source_caption(custom_gemini, _env_gemini_key()))
+    custom_xai = st.text_input(
+        "Custom xAI API Key",
+        type="password",
+        placeholder="Optional — falls back to XAI_API_KEY",
+        help="Bring-your-own xAI key. If empty, ExpoPrep uses XAI_API_KEY from .env.",
+    )
+    st.caption(_key_source_caption(custom_xai, _env_xai_key()))
+    gemini_ok = bool((custom_gemini or "").strip() or _env_gemini_key())
+    xai_ok = bool((custom_xai or "").strip() or _env_xai_key())
     gemini_col, xai_col = st.columns(2)
     with gemini_col:
         if gemini_ok:
@@ -362,6 +478,18 @@ with st.sidebar:
             st.badge("XAI_API_KEY", color="green")
         else:
             st.badge("XAI_API_KEY missing", color="red")
+    st.caption(
+        "Architecture built on provider-agnostic LiteLLM abstraction. "
+        "Ready for xAI Grok-2 and Gemini."
+    )
+
+    st.divider()
+    briefing_mode = st.radio(
+        "Briefing mode",
+        options=BRIEFING_MODES,
+        index=0,
+        help="Quick-Scan keeps bullets tight for a 45-second booth glance.",
+    )
 
     st.divider()
     st.subheader("Resume")
@@ -423,12 +551,23 @@ output_slot = st.empty()
 download_slot = st.empty()
 
 
-def _render_briefing(markdown: str, *, download_key: str) -> None:
-    output_slot.markdown(markdown)
+def _display_markdown(markdown: str) -> str:
+    """Wrap the Latest News Hook section in a visual card for the Streamlit view."""
+    pattern = r"(## 📰 Latest News Hook\s*\n)(.*?)(?=\n## |\Z)"
+
+    def _wrap(match: re.Match[str]) -> str:
+        body = match.group(2).strip()
+        return f"{match.group(1)}\n<div class='news-hook'>\n\n{body}\n\n</div>\n\n"
+
+    return re.sub(pattern, _wrap, markdown, count=1, flags=re.S)
+
+
+def _render_briefing(markdown: str, *, company_name: str, download_key: str) -> None:
+    output_slot.markdown(_display_markdown(markdown), unsafe_allow_html=True)
     download_slot.download_button(
-        label="Download prep_briefing.md",
+        label="Download Briefing (.md)",
         data=markdown,
-        file_name="prep_briefing.md",
+        file_name=_briefing_filename(company_name),
         mime="text/markdown",
         use_container_width=True,
         key=download_key,
@@ -439,11 +578,15 @@ if generate:
     if not resume_text:
         st.warning("Add a resume PDF or paste resume text in the sidebar for a sharper pitch.")
 
-    needed = _api_key_for_model(model_id)
+    needed = _api_key_for_model(
+        model_id,
+        gemini_override=custom_gemini,
+        xai_override=custom_xai,
+    )
     if not needed:
         st.error(
             f"Missing API key for `{model_id}`. "
-            "Add GEMINI_API_KEY or XAI_API_KEY to your `.env` file and restart Streamlit."
+            "Paste a custom key in the sidebar or add GEMINI_API_KEY / XAI_API_KEY to `.env`."
         )
         st.stop()
 
@@ -461,6 +604,8 @@ if generate:
                 company=company,
                 role=role,
                 resume_text=resume_text,
+                briefing_mode=briefing_mode,
+                api_key=needed,
                 log=log_step,
             )
     except Exception as exc:
@@ -469,9 +614,14 @@ if generate:
         st.stop()
 
     st.session_state["briefing"] = briefing
+    st.session_state["briefing_company"] = company
     st.session_state["trace"] = "\n\n".join(traces)
     status_slot.success("Prep briefing ready.")
-    _render_briefing(briefing, download_key="download_fresh")
+    _render_briefing(briefing, company_name=company, download_key="download_fresh")
 elif "briefing" in st.session_state:
     trace_slot.markdown(st.session_state.get("trace", "_No trace stored._"))
-    _render_briefing(st.session_state["briefing"], download_key="download_cached")
+    _render_briefing(
+        st.session_state["briefing"],
+        company_name=st.session_state.get("briefing_company") or company,
+        download_key="download_cached",
+    )
